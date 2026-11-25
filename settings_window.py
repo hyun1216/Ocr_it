@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
@@ -520,13 +521,19 @@ class SettingsWindow:
         self.win.focus_force()
 
     def _apply_window_icon(self, icon_image: Optional[object]) -> None:
-        ico_path = Path(__file__).resolve().with_name("Ocr_it.ico")
-        if ico_path.exists():
-            try:
-                self.win.iconbitmap(str(ico_path))
-                return
-            except tk.TclError:
-                pass
+        candidates: list[Path] = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "OCR_IT.ico")
+        candidates.append(Path(__file__).resolve().with_name("OCR_IT.ico"))
+
+        for ico_path in candidates:
+            if ico_path.exists():
+                try:
+                    self.win.iconbitmap(str(ico_path))
+                    return
+                except tk.TclError:
+                    pass
         if icon_image is not None:
             try:
                 self._icon_photo = ImageTk.PhotoImage(icon_image)

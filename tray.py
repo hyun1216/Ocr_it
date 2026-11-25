@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import pystray
@@ -507,6 +509,7 @@ class AboutDialog:
         win.configure(bg=BG_WHITE)
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        _apply_ico(win)
 
         frame = tk.Frame(win, bg=BG_WHITE, padx=22, pady=18)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -586,6 +589,7 @@ class UsageGuideDialog:
         win.configure(bg="#F5F7FA")
         win.resizable(False, False)
         win.attributes("-topmost", True)
+        _apply_ico(win)
 
         container = tk.Frame(win, bg="#F5F7FA", padx=22, pady=20)
         container.pack(fill=tk.BOTH, expand=True)
@@ -681,8 +685,37 @@ class UsageGuideDialog:
         win.focus_force()
 
 
+def _find_ico_path() -> Optional[Path]:
+    """Locate OCR_IT.ico in PyInstaller bundle or workspace root."""
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "OCR_IT.ico")
+    candidates.append(Path(__file__).resolve().with_name("OCR_IT.ico"))
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def _apply_ico(win: tk.Toplevel) -> None:
+    ico = _find_ico_path()
+    if ico is not None:
+        try:
+            win.iconbitmap(str(ico))
+        except tk.TclError:
+            pass
+
+
 def create_tray_image() -> Image.Image:
-    """Generate a crisp 64x64 sky-blue viewfinder tray icon."""
+    """Load OCR_IT.ico if available, otherwise generate a sky-blue viewfinder icon."""
+    ico = _find_ico_path()
+    if ico is not None:
+        try:
+            return Image.open(ico).convert("RGBA")
+        except Exception:
+            pass
+
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
