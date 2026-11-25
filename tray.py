@@ -13,6 +13,8 @@ from typing import Callable, Optional
 import pystray
 from PIL import Image, ImageDraw
 
+from ui_graphics import make_rounded_rect_photo, make_toggle_photo
+
 PRIMARY_BLUE = "#0066FF"
 SOFT_BLUE_BG = "#EBF3FE"
 BG_WHITE = "#FFFFFF"
@@ -51,9 +53,17 @@ def get_work_area() -> tuple[int, int, int, int]:
 
 
 def resolve_font_family(root: tk.Misc) -> str:
-    """Prefer Pretendard font, falling back to Malgun Gothic or Segoe UI."""
+    """Prefer Pretendard or SUIT/Noto/Malgun Gothic for crisp Korean UI legibility."""
     available = set(tkfont.families(root))
-    for candidate in ("Pretendard", "Pretendard Variable", "Malgun Gothic", "Segoe UI"):
+    for candidate in (
+        "Pretendard",
+        "Pretendard Variable",
+        "SUIT",
+        "Noto Sans KR",
+        "맑은 고딕",
+        "Malgun Gothic",
+        "Segoe UI",
+    ):
         if candidate in available:
             return candidate
     return "TkDefaultFont"
@@ -106,18 +116,18 @@ class ToastNotification:
         inner = tk.Frame(self.win, bg=BG_WHITE, padx=14, pady=10)
         inner.pack(padx=1, pady=1, fill=tk.BOTH, expand=True)
 
-        icon_text = "!" if is_error else "✓"
+        icon_text = "오류" if is_error else "완료"
         icon_color = "#EF4444" if is_error else PRIMARY_BLUE
         icon_bg = "#FEE2E2" if is_error else SOFT_BLUE_BG
 
         badge = tk.Label(
             inner,
             text=icon_text,
-            font=(font_family, 10, "bold"),
+            font=(font_family, 9, "bold"),
             fg=icon_color,
             bg=icon_bg,
-            width=2,
-            height=1,
+            padx=7,
+            pady=2,
         )
         badge.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -128,7 +138,7 @@ class ToastNotification:
         label = tk.Label(
             inner,
             text=first_line,
-            font=(font_family, 10),
+            font=(font_family, 11),
             fg=TEXT_PRIMARY,
             bg=BG_WHITE,
             anchor="w",
@@ -189,30 +199,16 @@ class ToggleSwitch(tk.Canvas):
 
     def _redraw(self) -> None:
         self.delete("all")
-        bg_color = PRIMARY_BLUE if self._state else TOGGLE_OFF_BG
-        r = self._height // 2
-        self.create_oval(0, 0, self._height, self._height, fill=bg_color, outline="")
-        self.create_oval(
-            self._width - self._height,
-            0,
-            self._width,
-            self._height,
-            fill=bg_color,
-            outline="",
+        self._toggle_photo = make_toggle_photo(
+            width=self._width,
+            height=self._height,
+            is_on=self._state,
+            on_color=PRIMARY_BLUE,
+            off_color=TOGGLE_OFF_BG,
+            knob_color=BG_WHITE,
+            parent_bg=BG_WHITE,
         )
-        self.create_rectangle(r, 0, self._width - r, self._height, fill=bg_color, outline="")
-
-        pad = 3
-        knob_d = self._height - pad * 2
-        knob_x = (self._width - pad - knob_d) if self._state else pad
-        self.create_oval(
-            knob_x,
-            pad,
-            knob_x + knob_d,
-            pad + knob_d,
-            fill=BG_WHITE,
-            outline="",
-        )
+        self.create_image(0, 0, anchor=tk.NW, image=self._toggle_photo)
 
 
 class HistoryPopup:
@@ -261,12 +257,12 @@ class HistoryPopup:
 
         close_btn = tk.Label(
             title_row,
-            text="✕",
-            font=(font_family, 10),
+            text="닫기",
+            font=(font_family, 10, "bold"),
             fg=TEXT_SECONDARY,
             bg=BG_WHITE,
             cursor="hand2",
-            padx=4,
+            padx=6,
         )
         close_btn.pack(side=tk.RIGHT)
         close_btn.bind("<Button-1>", lambda _e: self.close())
@@ -274,11 +270,11 @@ class HistoryPopup:
         capture_btn = tk.Label(
             title_row,
             text=f"캡처 ({hotkey.upper()})",
-            font=(font_family, 9, "bold"),
+            font=(font_family, 10, "bold"),
             fg=PRIMARY_BLUE,
             bg=SOFT_BLUE_BG,
-            padx=8,
-            pady=3,
+            padx=10,
+            pady=4,
             cursor="hand2",
         )
         capture_btn.pack(side=tk.RIGHT, padx=(0, 8))
@@ -413,17 +409,29 @@ class HistoryPopup:
         )
         card.pack(pady=(0, 8), anchor="w")
 
-        rect_id = _draw_rounded_rect(
-            card,
-            1,
-            1,
-            card_w - 2,
-            card_h - 2,
+        default_photo = make_rounded_rect_photo(
+            width=card_w,
+            height=card_h,
             radius=10,
-            fill=CARD_BG,
-            outline=BORDER_GRAY,
-            width=1,
+            fill_color=CARD_BG,
+            border_color=BORDER_GRAY,
+            border_width=1,
+            parent_bg=BG_WHITE,
         )
+        active_photo = make_rounded_rect_photo(
+            width=card_w,
+            height=card_h,
+            radius=10,
+            fill_color=SOFT_BLUE_BG,
+            border_color=PRIMARY_BLUE,
+            border_width=1,
+            parent_bg=BG_WHITE,
+        )
+        if not hasattr(self, "_card_photos"):
+            self._card_photos: list[object] = []
+        self._card_photos.extend([default_photo, active_photo])
+
+        bg_id = card.create_image(0, 0, anchor=tk.NW, image=default_photo)
 
         flat_preview = " ".join(item.text.splitlines()).strip()
         if len(flat_preview) > 36:
@@ -444,26 +452,26 @@ class HistoryPopup:
             47,
             text=meta_text,
             anchor="w",
-            font=(self.font_family, 8),
+            font=(self.font_family, 9),
             fill=TEXT_SECONDARY,
         )
 
         check_id = card.create_text(
-            card_w - 20,
+            card_w - 16,
             card_h // 2,
             text="",
             anchor="e",
-            font=(self.font_family, 11, "bold"),
+            font=(self.font_family, 9, "bold"),
             fill=PRIMARY_BLUE,
         )
 
         def on_click(_event: tk.Event) -> None:
             self.on_copy_item(item.text)
-            card.itemconfigure(rect_id, fill=SOFT_BLUE_BG, outline=PRIMARY_BLUE)
-            card.itemconfigure(check_id, text="✓")
+            card.itemconfigure(bg_id, image=active_photo)
+            card.itemconfigure(check_id, text="복사됨")
             card.after(
                 1000,
-                lambda: _reset_card(card, rect_id, check_id),
+                lambda: _reset_card(card, bg_id, default_photo, check_id),
             )
 
         card.bind("<Button-1>", on_click)
@@ -480,122 +488,18 @@ class HistoryPopup:
             pass
 
 
-def _reset_card(card: tk.Canvas, rect_id: int, check_id: int) -> None:
+def _reset_card(
+    card: tk.Canvas, bg_id: int, default_photo: object, check_id: int
+) -> None:
     try:
-        card.itemconfigure(rect_id, fill=CARD_BG, outline=BORDER_GRAY)
+        card.itemconfigure(bg_id, image=default_photo)
         card.itemconfigure(check_id, text="")
     except tk.TclError:
         pass
 
 
-class SettingsDialog:
-    """Minimal settings dialog for global hotkey and Windows startup."""
-
-    def __init__(
-        self,
-        master: tk.Tk,
-        font_family: str,
-        current_hotkey: str,
-        startup_enabled: bool,
-        on_save: Callable[[str, bool], None],
-    ) -> None:
-        self.on_save = on_save
-        self.win = tk.Toplevel(master)
-        self.win.title("Ocr_it 설정")
-        self.win.configure(bg=BG_WHITE)
-        self.win.resizable(False, False)
-        self.win.attributes("-topmost", True)
-
-        frame = tk.Frame(self.win, bg=BG_WHITE, padx=20, pady=18)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            frame,
-            text="단축키 / 시작프로그램 설정",
-            font=(font_family, 12, "bold"),
-            fg=TEXT_PRIMARY,
-            bg=BG_WHITE,
-        ).pack(anchor="w", pady=(0, 12))
-
-        tk.Label(
-            frame,
-            text="캡처 단축키 (예: alt+q, ctrl+shift+q)",
-            font=(font_family, 9),
-            fg=TEXT_SECONDARY,
-            bg=BG_WHITE,
-        ).pack(anchor="w")
-
-        self.hotkey_var = tk.StringVar(value=current_hotkey)
-        entry = tk.Entry(
-            frame,
-            textvariable=self.hotkey_var,
-            font=(font_family, 10),
-            fg=TEXT_PRIMARY,
-            bg=CARD_BG,
-            relief=tk.SOLID,
-            bd=1,
-            width=28,
-        )
-        entry.pack(anchor="w", pady=(4, 12), ipady=4)
-
-        self.startup_var = tk.BooleanVar(value=startup_enabled)
-        chk = tk.Checkbutton(
-            frame,
-            text="Windows 시작 시 자동 실행",
-            variable=self.startup_var,
-            font=(font_family, 10),
-            fg=TEXT_PRIMARY,
-            bg=BG_WHITE,
-            activebackground=BG_WHITE,
-            selectcolor=BG_WHITE,
-        )
-        chk.pack(anchor="w", pady=(0, 16))
-
-        btn_row = tk.Frame(frame, bg=BG_WHITE)
-        btn_row.pack(fill=tk.X)
-
-        tk.Button(
-            btn_row,
-            text="취소",
-            font=(font_family, 9),
-            fg=TEXT_PRIMARY,
-            bg=CARD_BG,
-            relief=tk.FLAT,
-            padx=14,
-            pady=6,
-            cursor="hand2",
-            command=self.win.destroy,
-        ).pack(side=tk.RIGHT, padx=(8, 0))
-
-        tk.Button(
-            btn_row,
-            text="저장",
-            font=(font_family, 9, "bold"),
-            fg=BG_WHITE,
-            bg=PRIMARY_BLUE,
-            relief=tk.FLAT,
-            padx=14,
-            pady=6,
-            cursor="hand2",
-            command=self._save,
-        ).pack(side=tk.RIGHT)
-
-        self.win.update_idletasks()
-        w = self.win.winfo_reqwidth()
-        h = self.win.winfo_reqheight()
-        _, _, work_right, work_bottom = get_work_area()
-        self.win.geometry(f"+{work_right - w - 24}+{work_bottom - h - 24}")
-        self.win.focus_force()
-
-    def _save(self) -> None:
-        hotkey = self.hotkey_var.get().strip().lower() or "alt+q"
-        startup = self.startup_var.get()
-        self.win.destroy()
-        self.on_save(hotkey, startup)
-
-
 class AboutDialog:
-    """Minimal developer info dialog."""
+    """Minimal developer support dialog."""
 
     def __init__(self, master: tk.Tk, font_family: str) -> None:
         win = tk.Toplevel(master)
@@ -617,7 +521,7 @@ class AboutDialog:
 
         tk.Label(
             frame,
-            text="초경량 Windows 화면 텍스트 추출 유틸리티",
+            text="초경량 Windows 화면 텍스트 추출 · 플로팅 · 스크롤 캡처 유틸리티",
             font=(font_family, 9),
             fg=TEXT_SECONDARY,
             bg=BG_WHITE,
@@ -625,22 +529,25 @@ class AboutDialog:
 
         tk.Label(
             frame,
-            text="개발자: 노새봄",
-            font=(font_family, 10),
+            text="후원하기",
+            font=(font_family, 10, "bold"),
             fg=TEXT_PRIMARY,
             bg=BG_WHITE,
         ).pack(anchor="w")
 
         link = tk.Label(
             frame,
-            text="github.com/hyun1216",
+            text="https://buymeacoffee.com/devom",
             font=(font_family, 10, "underline"),
             fg=PRIMARY_BLUE,
             bg=BG_WHITE,
             cursor="hand2",
         )
         link.pack(anchor="w", pady=(4, 14))
-        link.bind("<Button-1>", lambda _e: webbrowser.open("https://github.com/hyun1216"))
+        link.bind(
+            "<Button-1>",
+            lambda _e: webbrowser.open("https://buymeacoffee.com/devom"),
+        )
 
         tk.Button(
             frame,
@@ -663,6 +570,117 @@ class AboutDialog:
         win.focus_force()
 
 
+class UsageGuideDialog:
+    """Clean Apple-style usage guide window opened from the tray menu."""
+
+    def __init__(
+        self,
+        master: tk.Tk,
+        font_family: str,
+        hotkey: str,
+        pin_hotkey: str,
+        scroll_hotkey: str,
+    ) -> None:
+        win = tk.Toplevel(master)
+        win.title("Ocr_it 사용방법")
+        win.configure(bg="#F5F7FA")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        container = tk.Frame(win, bg="#F5F7FA", padx=22, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            container,
+            text="Ocr_it 사용방법",
+            font=(font_family, 15, "bold"),
+            fg=TEXT_PRIMARY,
+            bg="#F5F7FA",
+        ).pack(anchor="w")
+
+        tk.Label(
+            container,
+            text="초경량 화면 텍스트 추출 · 플로팅 편집 · 스크롤 캡처 유틸리티",
+            font=(font_family, 10),
+            fg=TEXT_SECONDARY,
+            bg="#F5F7FA",
+        ).pack(anchor="w", pady=(2, 14))
+
+        sections = [
+            (
+                f"1. 텍스트 추출 캡처 ({hotkey.upper()})",
+                "원하는 영역을 드래그하거나 UI 블록 위에서 클릭(스마트 영역 감지)하면 "
+                "한글·영문·숫자 텍스트를 추출해 클립보드에 자동 복사합니다.",
+            ),
+            (
+                f"2. 화면 캡처 및 플로팅 ({pin_hotkey.upper()})",
+                "선택 영역 이미지를 클립보드에 복사하고 항상 맨 위 플로팅 창으로 고정합니다.\n"
+                "상단 '편집' 버튼 또는 우클릭으로 펜·사각형(색상/굵기 선택)·모자이크·자르기·저장을 사용할 수 있습니다.",
+            ),
+            (
+                f"3. 스크롤 캡처 ({scroll_hotkey.upper()})",
+                "긴 웹페이지나 채팅창 영역을 선택하면 자동으로 스크롤하며 한 장의 긴 이미지로 이어 붙입니다. "
+                "(중단: ESC 키)",
+            ),
+            (
+                "4. 트레이 아이콘 활용",
+                "- 좌클릭: 최근 추출 기록(최대 15개) 재복사 및 '숫자만 추출 모드' 전환\n"
+                "- 우클릭: 단축키 변경, 플로팅 자동 저장 경로, Windows 시작프로그램 설정",
+            ),
+        ]
+
+        for title, desc in sections:
+            card = tk.Frame(
+                container,
+                bg=BG_WHITE,
+                highlightbackground=BORDER_GRAY,
+                highlightthickness=1,
+                padx=14,
+                pady=11,
+            )
+            card.pack(fill=tk.X, pady=(0, 10))
+
+            tk.Label(
+                card,
+                text=title,
+                font=(font_family, 10, "bold"),
+                fg=PRIMARY_BLUE,
+                bg=BG_WHITE,
+                anchor="w",
+            ).pack(anchor="w")
+
+            tk.Label(
+                card,
+                text=desc,
+                font=(font_family, 9),
+                fg=TEXT_PRIMARY,
+                bg=BG_WHITE,
+                justify=tk.LEFT,
+                wraplength=420,
+                anchor="w",
+            ).pack(anchor="w", pady=(4, 0))
+
+        tk.Button(
+            container,
+            text="확인",
+            font=(font_family, 10, "bold"),
+            fg=BG_WHITE,
+            bg=PRIMARY_BLUE,
+            relief=tk.FLAT,
+            padx=20,
+            pady=6,
+            cursor="hand2",
+            command=win.destroy,
+        ).pack(anchor="e", pady=(6, 0))
+
+        win.update_idletasks()
+        w = win.winfo_reqwidth()
+        h = win.winfo_reqheight()
+        _, _, work_right, work_bottom = get_work_area()
+        win.geometry(f"+{work_right - w - 24}+{work_bottom - h - 24}")
+        win.focus_force()
+
+
 def create_tray_image() -> Image.Image:
     """Generate a crisp 64x64 sky-blue viewfinder tray icon."""
     size = 64
@@ -676,9 +694,9 @@ def create_tray_image() -> Image.Image:
     )
 
     white = (255, 255, 255, 255)
-    stroke = 4
-    pad = 16
-    arm = 10
+    stroke = 5
+    pad = 14
+    arm = 11
 
     # Four viewfinder corners
     draw.line([(pad, pad + arm), (pad, pad), (pad + arm, pad)], fill=white, width=stroke)
@@ -687,8 +705,8 @@ def create_tray_image() -> Image.Image:
     draw.line([(size - pad - arm, size - pad), (size - pad, size - pad), (size - pad, size - pad - arm)], fill=white, width=stroke)
 
     # Center text-line bars
-    draw.rounded_rectangle((22, 26, 42, 30), radius=2, fill=white)
-    draw.rounded_rectangle((22, 34, 36, 38), radius=2, fill=white)
+    draw.rounded_rectangle((21, 25, 43, 30), radius=2, fill=white)
+    draw.rounded_rectangle((21, 35, 37, 40), radius=2, fill=white)
     return img
 
 
@@ -698,16 +716,26 @@ class TrayController:
     def __init__(
         self,
         hotkey: str,
+        pin_hotkey: str,
+        scroll_hotkey: str,
         on_capture: Callable[[], None],
+        on_pin_capture: Callable[[], None],
+        on_scroll_capture: Callable[[], None],
         on_history: Callable[[], None],
         on_settings: Callable[[], None],
+        on_guide: Callable[[], None],
         on_about: Callable[[], None],
         on_quit: Callable[[], None],
     ) -> None:
         self._hotkey = hotkey
+        self._pin_hotkey = pin_hotkey
+        self._scroll_hotkey = scroll_hotkey
         self._on_capture = on_capture
+        self._on_pin_capture = on_pin_capture
+        self._on_scroll_capture = on_scroll_capture
         self._on_history = on_history
         self._on_settings = on_settings
+        self._on_guide = on_guide
         self._on_about = on_about
         self._on_quit = on_quit
 
@@ -721,34 +749,52 @@ class TrayController:
 
     def _build_menu(self) -> pystray.Menu:
         hotkey_label = self._hotkey.upper()
+        pin_hotkey_label = self._pin_hotkey.upper()
+        scroll_hotkey_label = self._scroll_hotkey.upper()
         return pystray.Menu(
             pystray.MenuItem(
-                f"📷 영역 캡처 ({hotkey_label})",
+                f"텍스트 추출 캡처 ({hotkey_label})",
                 lambda _icon, _item: self._on_capture(),
             ),
             pystray.MenuItem(
-                "📋 최근 추출 기록",
+                f"화면 캡처 및 플로팅 ({pin_hotkey_label})",
+                lambda _icon, _item: self._on_pin_capture(),
+            ),
+            pystray.MenuItem(
+                f"스크롤 캡처 ({scroll_hotkey_label})",
+                lambda _icon, _item: self._on_scroll_capture(),
+            ),
+            pystray.MenuItem(
+                "최근 추출 기록",
                 lambda _icon, _item: self._on_history(),
                 default=True,  # Left-click triggers default item on Windows
             ),
             pystray.MenuItem(
-                "⚙️ 단축키/시작프로그램 설정",
+                "단축키/시작프로그램 설정",
                 lambda _icon, _item: self._on_settings(),
             ),
             pystray.MenuItem(
-                "👩‍💻 개발자 정보 (노새봄 / github.com/hyun1216)",
+                "사용방법",
+                lambda _icon, _item: self._on_guide(),
+            ),
+            pystray.MenuItem(
+                "개발자 정보 / 후원하기",
                 lambda _icon, _item: self._on_about(),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "❌ 종료",
+                "종료",
                 lambda _icon, _item: self._on_quit(),
             ),
         )
 
-    def update_hotkey_label(self, hotkey: str) -> None:
-        """Refresh the tray menu to reflect an updated hotkey."""
+    def update_hotkeys(
+        self, hotkey: str, pin_hotkey: str, scroll_hotkey: str
+    ) -> None:
+        """Refresh the tray menu to reflect updated hotkeys."""
         self._hotkey = hotkey
+        self._pin_hotkey = pin_hotkey
+        self._scroll_hotkey = scroll_hotkey
         self._icon.menu = self._build_menu()
         self._icon.update_menu()
 

@@ -1,0 +1,10 @@
+pillow
+rapidocr-onnxruntime
+keyboard
+pystray
+pywin32
+pyinstaller
+uiautomation
+opencv-python
+numpy
+pyautogui
