@@ -87,6 +87,10 @@ def _find_hwnd_under_cursor(x: int, y: int) -> Optional[int]:
             return True
         if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             if rect.left <= x <= rect.right and rect.top <= y <= rect.bottom:
+                cls_buf = ctypes.create_unicode_buffer(64)
+                user32.GetClassNameW(hwnd, cls_buf, 64)
+                if cls_buf.value in ("Progman", "WorkerW", "Shell_TrayWnd"):
+                    return True
                 if (rect.right - rect.left) >= MIN_SMART_WIDTH and (
                     rect.bottom - rect.top
                 ) >= MIN_SMART_HEIGHT:
@@ -390,6 +394,8 @@ class ScreenSnipper:
             self._draw_highlight(self._start_x, self._start_y, event.x, event.y)
 
     def _on_mouse_up(self, event: tk.Event) -> None:
+        if not self._is_dragging:
+            return
         self._is_dragging = False
         if self._has_dragged:
             x1, y1, x2, y2 = self._clamp_canvas_box(
