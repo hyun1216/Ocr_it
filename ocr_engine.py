@@ -127,6 +127,17 @@ def _get_ocr_engine() -> Any:
         return _ocr_instance
 
 
+def preload_ocr_engine() -> None:
+    """Warm up the RapidOCR singleton in a background daemon thread at startup."""
+    def _loader() -> None:
+        try:
+            _get_ocr_engine()
+        except Exception:
+            pass
+
+    threading.Thread(target=_loader, daemon=True).start()
+
+
 def _merge_lines_by_y(results: list[Any]) -> str:
     """Group OCR boxes by Y-coordinate and insert spaces based on horizontal X-gap."""
     # Each item: (y_center, x_min, x_max, height, text)

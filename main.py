@@ -18,7 +18,7 @@ import keyboard
 from PIL import Image
 
 from floating_pin import FloatingPinWindow, copy_image_to_clipboard
-from ocr_engine import OcrEngineError, extract_text, filter_numbers_only
+from ocr_engine import OcrEngineError, extract_text, filter_numbers_only, preload_ocr_engine
 from scroll_capture import run_scroll_capture
 from settings_window import SettingsWindow
 from snipper import ScreenSnipper
@@ -491,7 +491,8 @@ class OcrItApp:
         self.root.after(50, self._poll_queue)
 
     def run(self) -> None:
-        """Start tray icon, register hotkeys, and enter the Tk event loop."""
+        """Start tray icon, preload OCR, register hotkeys, and enter Tk loop."""
+        preload_ocr_engine()
         self._register_hotkey(self.hotkey)
         self._register_pin_hotkey(self.pin_hotkey)
         self._register_scroll_hotkey(self.scroll_hotkey)

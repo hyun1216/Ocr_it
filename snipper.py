@@ -1,12 +1,17 @@
-"""Full-screen freeze-frame snipping overlay with UIA smart region detection."""
+"""Full-screen freeze-frame snipping overlay with mss capture and lazy UIA detection."""
 
 from __future__ import annotations
 
 import ctypes
+import os
+import threading
 import tkinter as tk
+from ctypes import wintypes
 from typing import Callable, Optional
 
-from PIL import Image, ImageEnhance, ImageGrab, ImageTk
+import mss
+import numpy as np
+from PIL import Image, ImageGrab, ImageTk
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -15,15 +20,11 @@ SM_CYVIRTUALSCREEN = 79
 
 ACCENT_BLUE = "#0066FF"
 BADGE_TEXT = "#FFFFFF"
-DIM_BRIGHTNESS = 0.65
+DIM_FACTOR = 0.65
 MIN_DRAG_DISTANCE = 5
 MIN_SMART_WIDTH = 28
 MIN_SMART_HEIGHT = 20
-MAX_SCAN_NODES = 600
-
-
-class _POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+HOVER_DEBOUNCE_MS = 80
 
 
 def get_virtual_screen_rect() -> tuple[int, int, int, int]:
@@ -36,87 +37,134 @@ def get_virtual_screen_rect() -> tuple[int, int, int, int]:
     return left, top, width, height
 
 
-def _collect_ui_rects(
-    v_width: int, v_height: int
-) -> list[tuple[int, int, int, int]]:
-    """Pre-scan visible UI control bounding boxes using Windows UI Automation."""
+def _grab_virtual_screen_fast(
+    v_left: int, v_top: int, v_width: int, v_height: int
+) -> tuple[Image.Image, Image.Image]:
+    """Capture virtual screen with mss and build dimmed background via NumPy."""
+    try:
+        with mss.mss() as sct:
+            monitor = {
+                "left": v_left,
+                "top": v_top,
+                "width": v_width,
+                "height": v_height,
+            }
+            shot = sct.grab(monitor)
+            bgra = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(
+                shot.height, shot.width, 4
+            )
+            rgb = np.ascontiguousarray(bgra[:, :, 2::-1])
+            frozen_img = Image.fromarray(rgb)
+            dimmed_arr = (rgb.astype(np.uint16) * int(DIM_FACTOR * 256) >> 8).astype(
+                np.uint8
+            )
+            dimmed_img = Image.fromarray(dimmed_arr)
+            return frozen_img, dimmed_img
+    except Exception:
+        frozen_img = ImageGrab.grab(
+            bbox=(v_left, v_top, v_left + v_width, v_top + v_height),
+            all_screens=True,
+        ).convert("RGB")
+        arr = np.asarray(frozen_img, dtype=np.uint16)
+        dimmed_arr = (arr * int(DIM_FACTOR * 256) >> 8).astype(np.uint8)
+        return frozen_img, Image.fromarray(dimmed_arr)
+
+
+def _find_hwnd_under_cursor(x: int, y: int) -> Optional[int]:
+    """Find the topmost visible non-self window containing (x, y)."""
+    user32 = ctypes.windll.user32
+    current_pid = os.getpid()
+    found_hwnd: list[int] = []
+    rect = wintypes.RECT()
+    pid = wintypes.DWORD()
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return True
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == current_pid:
+            return True
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            if rect.left <= x <= rect.right and rect.top <= y <= rect.bottom:
+                if (rect.right - rect.left) >= MIN_SMART_WIDTH and (
+                    rect.bottom - rect.top
+                ) >= MIN_SMART_HEIGHT:
+                    found_hwnd.append(hwnd)
+                    return False
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    return found_hwnd[0] if found_hwnd else None
+
+
+def _query_ui_box_at_point(
+    x: int, y: int, max_area: int
+) -> Optional[tuple[int, int, int, int]]:
+    """Query a single point via UIA by descending only along the matching branch."""
     try:
         import uiautomation as auto  # type: ignore
     except ImportError:
-        return []
+        return None
 
-    rects: list[tuple[int, int, int, int]] = []
-    seen: set[tuple[int, int, int, int]] = set()
-    max_area = int(v_width * v_height * 0.92)
+    hwnd = _find_hwnd_under_cursor(x, y)
+    if not hwnd:
+        return None
 
-    def _add_rect(ctrl: object) -> None:
-        try:
-            rect = ctrl.BoundingRectangle  # type: ignore[attr-defined]
-            if rect is None:
-                return
-            l, t, r, b = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
-            w, h = r - l, b - t
-            if (
-                w >= MIN_SMART_WIDTH
-                and h >= MIN_SMART_HEIGHT
-                and (w * h) < max_area
-                and (l, t, r, b) not in seen
-            ):
-                seen.add((l, t, r, b))
-                rects.append((l, t, r, b))
-        except Exception:
-            pass
-
-    # 1. Immediately capture the control under the cursor and its parent chain
+    candidates: list[tuple[int, int, int, int]] = []
     try:
-        pt = _POINT()
-        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
-            cur = auto.ControlFromPoint(pt.x, pt.y)
-            for _ in range(8):
-                if cur is None:
+        with auto.UIAutomationInitializerInThread():
+            ctrl = auto.ControlFromHandle(hwnd)
+            for _ in range(12):
+                if ctrl is None:
                     break
-                _add_rect(cur)
-                cur = cur.GetParentControl()
+                rect = ctrl.BoundingRectangle
+                if rect is not None:
+                    l, t, r, b = (
+                        int(rect.left),
+                        int(rect.top),
+                        int(rect.right),
+                        int(rect.bottom),
+                    )
+                    w, h = r - l, b - t
+                    if (
+                        w >= MIN_SMART_WIDTH
+                        and h >= MIN_SMART_HEIGHT
+                        and (w * h) < max_area
+                        and l <= x <= r
+                        and t <= y <= b
+                    ):
+                        candidates.append((l, t, r, b))
+
+                next_ctrl = None
+                for child in ctrl.GetChildren():
+                    try:
+                        c_rect = child.BoundingRectangle
+                        if (
+                            c_rect is not None
+                            and c_rect.left <= x <= c_rect.right
+                            and c_rect.top <= y <= c_rect.bottom
+                        ):
+                            next_ctrl = child
+                            break
+                    except Exception:
+                        continue
+                ctrl = next_ctrl
     except Exception:
-        pass
+        return None
 
-    # 2. Scan foreground window deeply (up to depth 10) and top-level windows
-    roots: list[tuple[object, int]] = []
-    try:
-        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-        if fg_hwnd:
-            fg_ctrl = auto.ControlFromHandle(fg_hwnd)
-            if fg_ctrl is not None:
-                roots.append((fg_ctrl, 0))
-        root_ctrl = auto.GetRootControl()
-        if root_ctrl is not None:
-            for child in root_ctrl.GetChildren()[:10]:
-                if child is not None:
-                    roots.append((child, 6))
-    except Exception:
-        pass
+    if not candidates:
+        return None
 
-    queue: list[tuple[object, int]] = list(roots)
-    visited = 0
-
-    while queue and visited < MAX_SCAN_NODES:
-        ctrl, depth = queue.pop(0)
-        visited += 1
-        _add_rect(ctrl)
-        if depth < 10:
-            try:
-                for child in ctrl.GetChildren():  # type: ignore[attr-defined]
-                    if child is not None:
-                        queue.append((child, depth + 1))
-            except Exception:
-                continue
-
-    rects.sort(key=lambda rc: (rc[2] - rc[0]) * (rc[3] - rc[1]))
-    return rects
+    candidates.sort(key=lambda rc: (rc[2] - rc[0]) * (rc[3] - rc[1]))
+    for rc in candidates:
+        if (rc[2] - rc[0]) >= 80 and (rc[3] - rc[1]) >= 40:
+            return rc
+    return candidates[0]
 
 
 class ScreenSnipper:
-    """Opaque freeze-frame multi-monitor overlay with smart click & manual drag."""
+    """Opaque freeze-frame multi-monitor overlay with lazy debounced UIA detection."""
 
     def __init__(
         self,
@@ -129,20 +177,12 @@ class ScreenSnipper:
         self.on_cancel = on_cancel
 
         self._v_left, self._v_top, self._v_width, self._v_height = get_virtual_screen_rect()
+        self._max_smart_area = int(self._v_width * self._v_height * 0.92)
 
-        # Freeze entire virtual screen & scan UI tree BEFORE creating/focusing overlay
-        self._frozen_image = ImageGrab.grab(
-            bbox=(
-                self._v_left,
-                self._v_top,
-                self._v_left + self._v_width,
-                self._v_top + self._v_height,
-            ),
-            all_screens=True,
-        ).convert("RGB")
-        self._ui_rects = _collect_ui_rects(self._v_width, self._v_height)
-
-        dimmed = ImageEnhance.Brightness(self._frozen_image).enhance(DIM_BRIGHTNESS)
+        # Fast mss snapshot + NumPy dimming (no UIA scan at startup)
+        self._frozen_image, dimmed = _grab_virtual_screen_fast(
+            self._v_left, self._v_top, self._v_width, self._v_height
+        )
         self._dimmed_photo = ImageTk.PhotoImage(dimmed)
         self._crop_photo: Optional[ImageTk.PhotoImage] = None
 
@@ -151,6 +191,8 @@ class ScreenSnipper:
         self._is_dragging = False
         self._has_dragged = False
         self._smart_bbox: Optional[tuple[int, int, int, int]] = None
+        self._hover_timer: Optional[str] = None
+        self._hover_req_id = 0
 
         self._crop_img_id: Optional[int] = None
         self._rect_id: Optional[int] = None
@@ -191,21 +233,6 @@ class ScreenSnipper:
         self.overlay.focus_force()
         self.overlay.grab_set()
 
-    def _find_smart_rect(self, x_root: int, y_root: int) -> Optional[tuple[int, int, int, int]]:
-        """Find the best UI bounding box under the cursor, expanding tiny controls."""
-        matches = [
-            rc
-            for rc in self._ui_rects
-            if rc[0] <= x_root <= rc[2] and rc[1] <= y_root <= rc[3]
-        ]
-        if not matches:
-            return None
-
-        for rc in matches:
-            if (rc[2] - rc[0]) >= 80 and (rc[3] - rc[1]) >= 40:
-                return rc
-        return matches[0]
-
     def _clamp_canvas_box(
         self, cx1: int, cy1: int, cx2: int, cy2: int
     ) -> tuple[int, int, int, int]:
@@ -223,7 +250,6 @@ class ScreenSnipper:
         if w < 2 or h < 2:
             return
 
-        # Reveal 100%-brightness original snapshot inside the selection box
         bright_crop = self._frozen_image.crop((x1, y1, x2, y2))
         self._crop_photo = ImageTk.PhotoImage(bright_crop)
         self._crop_img_id = self.canvas.create_image(
@@ -276,9 +302,48 @@ class ScreenSnipper:
         self._crop_photo = None
 
     def _on_mouse_move(self, event: tk.Event) -> None:
-        if self._is_dragging:
+        if self._is_dragging or self._closed:
             return
-        bbox = self._find_smart_rect(event.x_root, event.y_root)
+
+        if self._hover_timer is not None:
+            try:
+                self.overlay.after_cancel(self._hover_timer)
+            except tk.TclError:
+                pass
+            self._hover_timer = None
+
+        x_root, y_root = event.x_root, event.y_root
+        self._hover_timer = self.overlay.after(
+            HOVER_DEBOUNCE_MS,
+            lambda: self._dispatch_smart_query(x_root, y_root),
+        )
+
+    def _dispatch_smart_query(self, x_root: int, y_root: int) -> None:
+        self._hover_timer = None
+        if self._is_dragging or self._closed:
+            return
+
+        self._hover_req_id += 1
+        req_id = self._hover_req_id
+
+        def _worker() -> None:
+            bbox = _query_ui_box_at_point(x_root, y_root, self._max_smart_area)
+            if self._closed or req_id != self._hover_req_id:
+                return
+            try:
+                self.overlay.after(
+                    0, lambda: self._apply_smart_rect(req_id, bbox)
+                )
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_smart_rect(
+        self, req_id: int, bbox: Optional[tuple[int, int, int, int]]
+    ) -> None:
+        if self._closed or self._is_dragging or req_id != self._hover_req_id:
+            return
         if bbox == self._smart_bbox:
             return
         self._smart_bbox = bbox
@@ -293,6 +358,13 @@ class ScreenSnipper:
         )
 
     def _on_mouse_down(self, event: tk.Event) -> None:
+        if self._hover_timer is not None:
+            try:
+                self.overlay.after_cancel(self._hover_timer)
+            except tk.TclError:
+                pass
+            self._hover_timer = None
+        self._hover_req_id += 1
         self._start_x = event.x
         self._start_y = event.y
         self._is_dragging = True
@@ -329,7 +401,6 @@ class ScreenSnipper:
             self.on_capture(image, abs_bbox)
             return
 
-        # Click without drag -> capture smart-detected UI region from frozen snapshot
         smart_bbox = self._smart_bbox
         self._close_overlay()
         if smart_bbox is None:
@@ -364,6 +435,12 @@ class ScreenSnipper:
         if self._closed:
             return
         self._closed = True
+        if self._hover_timer is not None:
+            try:
+                self.overlay.after_cancel(self._hover_timer)
+            except tk.TclError:
+                pass
+            self._hover_timer = None
         try:
             self.overlay.grab_release()
         except tk.TclError:

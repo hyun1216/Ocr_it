@@ -8,3 +8,4 @@ uiautomation
 opencv-python
 numpy
 pyautogui
+mss
