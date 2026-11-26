@@ -35,11 +35,25 @@ from tray import (
 )
 
 APP_NAME = "Ocr_it"
+MUTEX_NAME = "Local\\Ocr_it_SingleInstance_Mutex"
+ERROR_ALREADY_EXISTS = 183
 MAX_HISTORY = 15
 DEFAULT_HOTKEY = "alt+q"
 DEFAULT_PIN_HOTKEY = "alt+w"
 DEFAULT_SCROLL_HOTKEY = "alt+s"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def acquire_single_instance_mutex() -> Optional[int]:
+    """Create a named Win32 mutex; return handle if first instance, else None."""
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if not handle:
+        return None
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
 
 
 def enable_high_dpi() -> None:
@@ -502,9 +516,16 @@ class OcrItApp:
 
 
 def main() -> None:
+    mutex_handle = acquire_single_instance_mutex()
+    if mutex_handle is None:
+        return
+
     enable_high_dpi()
     app = OcrItApp()
-    app.run()
+    try:
+        app.run()
+    finally:
+        ctypes.windll.kernel32.CloseHandle(mutex_handle)
 
 
 if __name__ == "__main__":

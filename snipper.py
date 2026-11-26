@@ -1,4 +1,4 @@
-"""Full-screen multi-monitor snipping overlay with UIA smart region detection."""
+"""Full-screen freeze-frame snipping overlay with UIA smart region detection."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import ctypes
 import tkinter as tk
 from typing import Callable, Optional
 
-from PIL import Image, ImageGrab
+from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -15,6 +15,7 @@ SM_CYVIRTUALSCREEN = 79
 
 ACCENT_BLUE = "#0066FF"
 BADGE_TEXT = "#FFFFFF"
+DIM_BRIGHTNESS = 0.65
 MIN_DRAG_DISTANCE = 5
 MIN_SMART_WIDTH = 28
 MIN_SMART_HEIGHT = 20
@@ -82,13 +83,12 @@ def _collect_ui_rects(
         except Exception:
             continue
 
-    # Sort smallest area first so innermost meaningful block is matched first
     rects.sort(key=lambda rc: (rc[2] - rc[0]) * (rc[3] - rc[1]))
     return rects
 
 
 class ScreenSnipper:
-    """Semi-transparent multi-monitor overlay supporting smart click & manual drag."""
+    """Opaque freeze-frame multi-monitor overlay with smart click & manual drag."""
 
     def __init__(
         self,
@@ -101,7 +101,22 @@ class ScreenSnipper:
         self.on_cancel = on_cancel
 
         self._v_left, self._v_top, self._v_width, self._v_height = get_virtual_screen_rect()
+
+        # Freeze entire virtual screen & scan UI tree BEFORE creating/focusing overlay
+        self._frozen_image = ImageGrab.grab(
+            bbox=(
+                self._v_left,
+                self._v_top,
+                self._v_left + self._v_width,
+                self._v_top + self._v_height,
+            ),
+            all_screens=True,
+        ).convert("RGB")
         self._ui_rects = _collect_ui_rects(self._v_width, self._v_height)
+
+        dimmed = ImageEnhance.Brightness(self._frozen_image).enhance(DIM_BRIGHTNESS)
+        self._dimmed_photo = ImageTk.PhotoImage(dimmed)
+        self._crop_photo: Optional[ImageTk.PhotoImage] = None
 
         self._start_x = 0
         self._start_y = 0
@@ -109,6 +124,7 @@ class ScreenSnipper:
         self._has_dragged = False
         self._smart_bbox: Optional[tuple[int, int, int, int]] = None
 
+        self._crop_img_id: Optional[int] = None
         self._rect_id: Optional[int] = None
         self._badge_bg_id: Optional[int] = None
         self._badge_txt_id: Optional[int] = None
@@ -118,7 +134,7 @@ class ScreenSnipper:
         self.overlay.withdraw()
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
-        self.overlay.attributes("-alpha", 0.35)
+        self.overlay.attributes("-alpha", 1.0)
         self.overlay.configure(bg="#000000", cursor="crosshair")
         self.overlay.geometry(
             f"{self._v_width}x{self._v_height}+{self._v_left}+{self._v_top}"
@@ -133,6 +149,7 @@ class ScreenSnipper:
             cursor="crosshair",
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._dimmed_photo)
 
         self.canvas.bind("<Motion>", self._on_mouse_move)
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
@@ -156,29 +173,48 @@ class ScreenSnipper:
         if not matches:
             return None
 
-        # Prefer a block larger than a tiny button/label if a parent container exists
         for rc in matches:
             if (rc[2] - rc[0]) >= 80 and (rc[3] - rc[1]) >= 40:
                 return rc
         return matches[0]
 
+    def _clamp_canvas_box(
+        self, cx1: int, cy1: int, cx2: int, cy2: int
+    ) -> tuple[int, int, int, int]:
+        x1 = max(0, min(self._v_width, min(cx1, cx2)))
+        y1 = max(0, min(self._v_height, min(cy1, cy2)))
+        x2 = max(0, min(self._v_width, max(cx1, cx2)))
+        y2 = max(0, min(self._v_height, max(cy1, cy2)))
+        return x1, y1, x2, y2
+
     def _draw_highlight(self, cx1: int, cy1: int, cx2: int, cy2: int) -> None:
         self._clear_highlight()
+        x1, y1, x2, y2 = self._clamp_canvas_box(cx1, cy1, cx2, cy2)
+        w = x2 - x1
+        h = y2 - y1
+        if w < 2 or h < 2:
+            return
+
+        # Reveal 100%-brightness original snapshot inside the selection box
+        bright_crop = self._frozen_image.crop((x1, y1, x2, y2))
+        self._crop_photo = ImageTk.PhotoImage(bright_crop)
+        self._crop_img_id = self.canvas.create_image(
+            x1, y1, anchor=tk.NW, image=self._crop_photo
+        )
+
         self._rect_id = self.canvas.create_rectangle(
-            cx1,
-            cy1,
-            cx2,
-            cy2,
+            x1,
+            y1,
+            x2,
+            y2,
             outline=ACCENT_BLUE,
             width=2,
-            fill="#FFFFFF",
+            fill="",
         )
-        w = max(0, cx2 - cx1)
-        h = max(0, cy2 - cy1)
         if w >= 20 and h >= 20:
             label = f"{w} × {h}"
-            bx = max(4, cx1)
-            by = max(4, cy1 - 24) if cy1 >= 28 else cy1 + 4
+            bx = max(4, x1)
+            by = max(4, y1 - 24) if y1 >= 28 else y1 + 4
             self._badge_bg_id = self.canvas.create_rectangle(
                 bx,
                 by,
@@ -197,12 +233,19 @@ class ScreenSnipper:
             )
 
     def _clear_highlight(self) -> None:
-        for item_id in (self._rect_id, self._badge_bg_id, self._badge_txt_id):
+        for item_id in (
+            self._crop_img_id,
+            self._rect_id,
+            self._badge_bg_id,
+            self._badge_txt_id,
+        ):
             if item_id is not None:
                 self.canvas.delete(item_id)
+        self._crop_img_id = None
         self._rect_id = None
         self._badge_bg_id = None
         self._badge_txt_id = None
+        self._crop_photo = None
 
     def _on_mouse_move(self, event: tk.Event) -> None:
         if self._is_dragging:
@@ -235,19 +278,14 @@ class ScreenSnipper:
         if dx >= MIN_DRAG_DISTANCE or dy >= MIN_DRAG_DISTANCE:
             self._has_dragged = True
         if self._has_dragged:
-            x1 = min(self._start_x, event.x)
-            y1 = min(self._start_y, event.y)
-            x2 = max(self._start_x, event.x)
-            y2 = max(self._start_y, event.y)
-            self._draw_highlight(x1, y1, x2, y2)
+            self._draw_highlight(self._start_x, self._start_y, event.x, event.y)
 
     def _on_mouse_up(self, event: tk.Event) -> None:
         self._is_dragging = False
         if self._has_dragged:
-            x1 = min(self._start_x, event.x)
-            y1 = min(self._start_y, event.y)
-            x2 = max(self._start_x, event.x)
-            y2 = max(self._start_y, event.y)
+            x1, y1, x2, y2 = self._clamp_canvas_box(
+                self._start_x, self._start_y, event.x, event.y
+            )
             self._close_overlay()
             if (x2 - x1) < MIN_DRAG_DISTANCE or (y2 - y1) < MIN_DRAG_DISTANCE:
                 if self.on_cancel:
@@ -259,21 +297,35 @@ class ScreenSnipper:
                 self._v_left + x2,
                 self._v_top + y2,
             )
-            self.master.after(40, lambda: self._capture_bbox(abs_bbox))
+            image = self._frozen_image.crop((x1, y1, x2, y2))
+            self.on_capture(image, abs_bbox)
             return
 
-        # Click without drag -> capture smart-detected UI region
+        # Click without drag -> capture smart-detected UI region from frozen snapshot
         smart_bbox = self._smart_bbox
         self._close_overlay()
         if smart_bbox is None:
             if self.on_cancel:
                 self.on_cancel()
             return
-        self.master.after(40, lambda: self._capture_bbox(smart_bbox))
-
-    def _capture_bbox(self, bbox: tuple[int, int, int, int]) -> None:
-        image = ImageGrab.grab(bbox=bbox, all_screens=True)
-        self.on_capture(image, bbox)
+        cx1, cy1, cx2, cy2 = self._clamp_canvas_box(
+            smart_bbox[0] - self._v_left,
+            smart_bbox[1] - self._v_top,
+            smart_bbox[2] - self._v_left,
+            smart_bbox[3] - self._v_top,
+        )
+        if (cx2 - cx1) < 2 or (cy2 - cy1) < 2:
+            if self.on_cancel:
+                self.on_cancel()
+            return
+        image = self._frozen_image.crop((cx1, cy1, cx2, cy2))
+        abs_bbox = (
+            self._v_left + cx1,
+            self._v_top + cy1,
+            self._v_left + cx2,
+            self._v_top + cy2,
+        )
+        self.on_capture(image, abs_bbox)
 
     def _handle_escape(self, _event: Optional[tk.Event] = None) -> None:
         self._close_overlay()
