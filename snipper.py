@@ -19,7 +19,11 @@ DIM_BRIGHTNESS = 0.65
 MIN_DRAG_DISTANCE = 5
 MIN_SMART_WIDTH = 28
 MIN_SMART_HEIGHT = 20
-MAX_SCAN_NODES = 350
+MAX_SCAN_NODES = 600
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
 def get_virtual_screen_rect() -> tuple[int, int, int, int]:
@@ -45,43 +49,67 @@ def _collect_ui_rects(
     seen: set[tuple[int, int, int, int]] = set()
     max_area = int(v_width * v_height * 0.92)
 
+    def _add_rect(ctrl: object) -> None:
+        try:
+            rect = ctrl.BoundingRectangle  # type: ignore[attr-defined]
+            if rect is None:
+                return
+            l, t, r, b = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+            w, h = r - l, b - t
+            if (
+                w >= MIN_SMART_WIDTH
+                and h >= MIN_SMART_HEIGHT
+                and (w * h) < max_area
+                and (l, t, r, b) not in seen
+            ):
+                seen.add((l, t, r, b))
+                rects.append((l, t, r, b))
+        except Exception:
+            pass
+
+    # 1. Immediately capture the control under the cursor and its parent chain
     try:
-        fg = auto.GetForegroundControl()
-        roots = [fg] if fg is not None else []
+        pt = _POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            cur = auto.ControlFromPoint(pt.x, pt.y)
+            for _ in range(8):
+                if cur is None:
+                    break
+                _add_rect(cur)
+                cur = cur.GetParentControl()
+    except Exception:
+        pass
+
+    # 2. Scan foreground window deeply (up to depth 10) and top-level windows
+    roots: list[tuple[object, int]] = []
+    try:
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if fg_hwnd:
+            fg_ctrl = auto.ControlFromHandle(fg_hwnd)
+            if fg_ctrl is not None:
+                roots.append((fg_ctrl, 0))
         root_ctrl = auto.GetRootControl()
         if root_ctrl is not None:
-            for child in root_ctrl.GetChildren()[:6]:
+            for child in root_ctrl.GetChildren()[:10]:
                 if child is not None:
-                    roots.append(child)
+                    roots.append((child, 6))
     except Exception:
-        return []
+        pass
 
-    queue: list[tuple[object, int]] = [(r, 0) for r in roots if r is not None]
+    queue: list[tuple[object, int]] = list(roots)
     visited = 0
 
     while queue and visited < MAX_SCAN_NODES:
         ctrl, depth = queue.pop(0)
         visited += 1
-        try:
-            rect = ctrl.BoundingRectangle  # type: ignore[attr-defined]
-            if rect is not None:
-                l, t, r, b = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
-                w, h = r - l, b - t
-                if (
-                    w >= MIN_SMART_WIDTH
-                    and h >= MIN_SMART_HEIGHT
-                    and (w * h) < max_area
-                    and (l, t, r, b) not in seen
-                ):
-                    seen.add((l, t, r, b))
-                    rects.append((l, t, r, b))
-
-            if depth < 5:
+        _add_rect(ctrl)
+        if depth < 10:
+            try:
                 for child in ctrl.GetChildren():  # type: ignore[attr-defined]
                     if child is not None:
                         queue.append((child, depth + 1))
-        except Exception:
-            continue
+            except Exception:
+                continue
 
     rects.sort(key=lambda rc: (rc[2] - rc[0]) * (rc[3] - rc[1]))
     return rects
