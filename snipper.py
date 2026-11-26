@@ -230,8 +230,17 @@ class ScreenSnipper:
 
         self.overlay.deiconify()
         self.overlay.lift()
+        self.overlay.update_idletasks()
         self.overlay.focus_force()
-        self.overlay.grab_set()
+        try:
+            self.overlay.grab_set()
+        except tk.TclError:
+            pass
+
+        # Trigger initial smart-region query at current cursor position immediately
+        pt = wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            self._dispatch_smart_query(pt.x, pt.y)
 
     def _clamp_canvas_box(
         self, cx1: int, cy1: int, cx2: int, cy2: int
@@ -402,6 +411,10 @@ class ScreenSnipper:
             return
 
         smart_bbox = self._smart_bbox
+        if smart_bbox is None:
+            smart_bbox = _query_ui_box_at_point(
+                event.x_root, event.y_root, self._max_smart_area
+            )
         self._close_overlay()
         if smart_bbox is None:
             if self.on_cancel:

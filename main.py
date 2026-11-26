@@ -10,11 +10,11 @@ import sys
 import threading
 import tkinter as tk
 import winreg
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-import keyboard
 from PIL import Image
 
 from floating_pin import FloatingPinWindow, copy_image_to_clipboard
@@ -42,6 +42,149 @@ DEFAULT_HOTKEY = "alt+q"
 DEFAULT_PIN_HOTKEY = "alt+w"
 DEFAULT_SCROLL_HOTKEY = "alt+s"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+WM_APP_SYNC = 0x8001
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+
+_VK_MAP: dict[str, int] = {
+    "space": 0x20,
+    "tab": 0x09,
+    "enter": 0x0D,
+    "return": 0x0D,
+    "esc": 0x1B,
+    "escape": 0x1B,
+    "backspace": 0x08,
+    "insert": 0x2D,
+    "delete": 0x2E,
+    "home": 0x24,
+    "end": 0x23,
+    "page_up": 0x21,
+    "prior": 0x21,
+    "page_down": 0x22,
+    "next": 0x22,
+    "left": 0x25,
+    "up": 0x26,
+    "right": 0x27,
+    "down": 0x28,
+    "print_screen": 0x2C,
+    "snapshot": 0x2C,
+    "pause": 0x13,
+    "caps_lock": 0x14,
+}
+
+
+def _parse_hotkey(hotkey_str: str) -> tuple[int, int]:
+    """Parse 'ctrl+shift+q' into (win32_modifiers | MOD_NOREPEAT, vk_code)."""
+    parts = [p.strip().lower() for p in hotkey_str.split("+") if p.strip()]
+    if not parts:
+        raise ValueError("단축키가 비어 있습니다.")
+
+    mods = MOD_NOREPEAT
+    key_part = parts[-1]
+    for mod in parts[:-1]:
+        if mod in ("alt", "menu"):
+            mods |= MOD_ALT
+        elif mod in ("ctrl", "control"):
+            mods |= MOD_CONTROL
+        elif mod == "shift":
+            mods |= MOD_SHIFT
+        elif mod in ("win", "windows", "super"):
+            mods |= MOD_WIN
+
+    if len(key_part) == 1 and key_part.isalnum():
+        return mods, ord(key_part.upper())
+    if key_part.startswith("f") and key_part[1:].isdigit():
+        fn = int(key_part[1:])
+        if 1 <= fn <= 24:
+            return mods, 0x70 + (fn - 1)
+    if key_part in _VK_MAP:
+        return mods, _VK_MAP[key_part]
+    raise ValueError(f"지원하지 않는 키입니다: {key_part}")
+
+
+class Win32HotkeyManager:
+    """OS-native RegisterHotKey message loop (no WH_KEYBOARD_LL hook lag or stuck keys)."""
+
+    def __init__(self) -> None:
+        self._callbacks: dict[int, Callable[[], None]] = {}
+        self._registered_ids: set[int] = set()
+        self._cmd_queue: queue.Queue[
+            tuple[str, int, int, int, Optional[Callable[[], None]], list, threading.Event]
+        ] = queue.Queue()
+        self._ready = threading.Event()
+        self._thread_id: int = 0
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=2.0)
+
+    def _loop(self) -> None:
+        user32 = ctypes.windll.user32
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        msg = wintypes.MSG()
+        # Force creation of the thread message queue before signaling ready
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
+        self._ready.set()
+
+        while True:
+            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if ret <= 0:
+                break
+            if msg.message == WM_HOTKEY:
+                cb = self._callbacks.get(int(msg.wParam))
+                if cb:
+                    cb()
+            elif msg.message == WM_APP_SYNC:
+                self._process_commands(user32)
+
+        for hk_id in list(self._registered_ids):
+            user32.UnregisterHotKey(None, hk_id)
+        self._registered_ids.clear()
+
+    def _process_commands(self, user32: object) -> None:
+        while True:
+            try:
+                cmd, hk_id, mods, vk, cb, result_box, done = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if cmd == "register":
+                if hk_id in self._registered_ids:
+                    user32.UnregisterHotKey(None, hk_id)  # type: ignore[attr-defined]
+                    self._registered_ids.discard(hk_id)
+                ok = bool(user32.RegisterHotKey(None, hk_id, mods, vk))  # type: ignore[attr-defined]
+                if ok and cb is not None:
+                    self._registered_ids.add(hk_id)
+                    self._callbacks[hk_id] = cb
+                    result_box.append((True, ""))
+                else:
+                    err = ctypes.GetLastError()
+                    result_box.append((False, f"Win32 Error {err}"))
+            done.set()
+
+    def register(
+        self, hk_id: int, hotkey_str: str, callback: Callable[[], None]
+    ) -> tuple[bool, str]:
+        try:
+            mods, vk = _parse_hotkey(hotkey_str)
+        except ValueError as exc:
+            return False, str(exc)
+
+        done = threading.Event()
+        result_box: list[tuple[bool, str]] = []
+        self._cmd_queue.put(("register", hk_id, mods, vk, callback, result_box, done))
+        ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_APP_SYNC, 0, 0)
+        done.wait(timeout=2.0)
+        return result_box[0] if result_box else (False, "시간 초과")
+
+    def stop(self) -> None:
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
 
 
 def acquire_single_instance_mutex() -> Optional[int]:
@@ -166,9 +309,7 @@ class OcrItApp:
         self._active_history: Optional[HistoryPopup] = None
         self._active_toast: Optional[ToastNotification] = None
         self._floating_windows: list[FloatingPinWindow] = []
-        self._hotkey_handle: Optional[object] = None
-        self._pin_hotkey_handle: Optional[object] = None
-        self._scroll_hotkey_handle: Optional[object] = None
+        self._hotkey_mgr = Win32HotkeyManager()
         self._scroll_in_progress = False
 
         self.tray = TrayController(
@@ -192,58 +333,28 @@ class OcrItApp:
         self.root.update()
 
     def _register_hotkey(self, hotkey: str) -> bool:
-        if self._hotkey_handle is not None:
-            try:
-                keyboard.remove_hotkey(self._hotkey_handle)
-            except Exception:
-                pass
-            self._hotkey_handle = None
-
-        try:
-            self._hotkey_handle = keyboard.add_hotkey(
-                hotkey,
-                lambda: self._ui_queue.put(("capture_ocr", None)),
-            )
-            return True
-        except Exception as exc:
-            self._show_toast(f"단축키 등록 실패 ({hotkey}): {exc}", is_error=True)
-            return False
+        ok, err = self._hotkey_mgr.register(
+            1, hotkey, lambda: self._ui_queue.put(("capture_ocr", None))
+        )
+        if not ok:
+            self._show_toast(f"단축키 등록 실패 ({hotkey}): {err}", is_error=True)
+        return ok
 
     def _register_pin_hotkey(self, hotkey: str) -> bool:
-        if self._pin_hotkey_handle is not None:
-            try:
-                keyboard.remove_hotkey(self._pin_hotkey_handle)
-            except Exception:
-                pass
-            self._pin_hotkey_handle = None
-
-        try:
-            self._pin_hotkey_handle = keyboard.add_hotkey(
-                hotkey,
-                lambda: self._ui_queue.put(("capture_pin", None)),
-            )
-            return True
-        except Exception as exc:
-            self._show_toast(f"플로팅 단축키 등록 실패 ({hotkey}): {exc}", is_error=True)
-            return False
+        ok, err = self._hotkey_mgr.register(
+            2, hotkey, lambda: self._ui_queue.put(("capture_pin", None))
+        )
+        if not ok:
+            self._show_toast(f"플로팅 단축키 등록 실패 ({hotkey}): {err}", is_error=True)
+        return ok
 
     def _register_scroll_hotkey(self, hotkey: str) -> bool:
-        if self._scroll_hotkey_handle is not None:
-            try:
-                keyboard.remove_hotkey(self._scroll_hotkey_handle)
-            except Exception:
-                pass
-            self._scroll_hotkey_handle = None
-
-        try:
-            self._scroll_hotkey_handle = keyboard.add_hotkey(
-                hotkey,
-                lambda: self._ui_queue.put(("capture_scroll", None)),
-            )
-            return True
-        except Exception as exc:
-            self._show_toast(f"스크롤 단축키 등록 실패 ({hotkey}): {exc}", is_error=True)
-            return False
+        ok, err = self._hotkey_mgr.register(
+            3, hotkey, lambda: self._ui_queue.put(("capture_scroll", None))
+        )
+        if not ok:
+            self._show_toast(f"스크롤 단축키 등록 실패 ({hotkey}): {err}", is_error=True)
+        return ok
 
     def _show_toast(self, message: str, is_error: bool = False) -> None:
         if self._active_toast is not None:
@@ -504,10 +615,7 @@ class OcrItApp:
         """Cleanly release hotkeys, floating windows, tray icon, and Tk loop."""
         for pin_win in list(self._floating_windows):
             pin_win.close()
-        try:
-            keyboard.unhook_all_hotkeys()
-        except Exception:
-            pass
+        self._hotkey_mgr.stop()
         self.tray.stop()
         try:
             self.root.quit()
